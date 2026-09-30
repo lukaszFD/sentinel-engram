@@ -1,0 +1,14 @@
+---
+# ============================================================
+# Sentinel Engram — host vars: zima (production, ZimaBoard 2)
+# ============================================================
+# Which Cyber Sentinel instance this Engram host reads from.
+# Must be an inventory_hostname from the [cs_sources] group.
+cs_source_host: "cs_rpi5"
+
+# Data directory (Cortex LMDB + Neo4j store + sync state).
+# ZimaBoard 2 832 has 32 GB eMMC only. The full Pi-hole blocklist
+# set produces several million inet:fqdn nodes — put this on the
+# SATA SSD, not on eMMC (capacity and write wear). Playbook 03
+# warns when this path resolves to an mmcblk device.
+engram_data_base: "/srv/sentinel-engram"

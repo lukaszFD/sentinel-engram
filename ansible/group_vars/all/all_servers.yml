@@ -1,0 +1,161 @@
+---
+# ============================================================
+# Sentinel Engram — Group Variables (non-secret)
+# ============================================================
+# Pairs with group_vars/all/vault.yml (ansible-vault encrypted,
+# template: vault.yml.example) for every `vault_*` value.
+# ============================================================
+
+# ------------------------------------------------------------
+# [VARS.PROJECT] Identity
+# ------------------------------------------------------------
+project_name: "sentinel-engram"
+
+# Local clone of this repository on the control host (Linux Mint).
+engram_repo_source_dir: "/home/hunter/IdeaProjects/sentinel-engram"
+
+# Local clone of Cyber Sentinel. Used ONLY to read the Pi-hole
+# adlists (single source of truth for blocklists — Engram never
+# keeps its own copy).
+cs_repo_source_dir: "/home/hunter/IdeaProjects/cyber-sentinel"
+cs_adlists_file: "{{ cs_repo_source_dir }}/config/pihole/adlists.txt"
+
+# ------------------------------------------------------------
+# [VARS.PATHS] Remote layout
+# ------------------------------------------------------------
+# Compose file, .env, rendered configs.
+remote_deploy_base: "/opt/{{ project_name }}"
+deployment_user: "{{ ansible_user }}"
+
+# Persistent data. Overridden per host in host_vars (SSD mount).
+engram_data_base: "/srv/{{ project_name }}"
+
+# ------------------------------------------------------------
+# [VARS.PROXMOX] Dev VM restore (restore_proxmox.yml)
+# ------------------------------------------------------------
+# Intentionally NOT defaulted: a wrong VMID would overwrite another
+# VM (e.g. Cyber Sentinel's dev VM, VMID 100). The restore play
+# fails fast until this is set.
+# engram_dev_vm_id: <VMID of the Sentinel Engram dev VM>
+proxmox_node: "local"
+backup_storage: "backups-seagate"
+
+# ------------------------------------------------------------
+# [VARS.NETWORK] Docker network
+# ------------------------------------------------------------
+# Distinct from Cyber Sentinel's 10.10.10.0/24 so both stacks can
+# run on the same dev hypervisor without address clashes.
+engram_network_name: "{{ project_name }}_internal_network"
+engram_network_subnet: "10.20.20.0/24"
+engram_ip_cortex: "10.20.20.10"
+engram_ip_neo4j: "10.20.20.11"
+engram_ip_nginx: "10.20.20.100"
+
+# Hostnames: cortex.<suffix>, neo4j.<suffix>
+domain_suffix: "{{ 'engram.local' if inventory_hostname in groups['engram-dev'] else 'engram.prod' }}"
+
+# ------------------------------------------------------------
+# [VARS.IMAGES] Container images — pinned by tag AND digest
+# ------------------------------------------------------------
+# Digest = what actually runs; tag = human-readable label.
+# Docker resolves by digest when both are given, so a re-pushed
+# tag can never change the deployed image silently.
+# Digests verified against Docker Hub on 2026-09-30.
+#
+# Synapse: v2.252.0, not v3.x. Every doc page, HTTP API reference
+# and Storm example this project relies on is published for 2.252;
+# v3.x is a new major line (config options marked "removed in 3.0",
+# data-model renames) with no published docs yet. Moving to v3 is
+# a deliberate migration, not a digest bump.
+image_synapse_cortex: "vertexproject/synapse-cortex:v2.252.0@sha256:259f0923128e9a15d84152f413fd6ce6b459c88924e83b252264bc1b43afa6f5"
+
+# Neo4j Community 2026.09.0 (Debian trixie base) — multi-arch index digest.
+image_neo4j: "neo4j:2026.09.0-community-trixie@sha256:91fb0bf237c41b7b3dcbe84703aa0b82e0d7d067b16e1c8ab21f03fc679edf4e"
+
+# Nginx 1.30.4 stable — multi-arch index digest.
+image_nginx: "nginx:1.30.4@sha256:09cc2702709e6388d979d8030e3ab4eb1ceb699b2dced26d7543e872a822e823"
+
+# Base image for the sync worker build.
+image_python: "python:3.12-slim-trixie@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f"
+
+# ------------------------------------------------------------
+# [VARS.LIMITS] Memory budget — ZimaBoard 2 has 8 GB, soldered
+# ------------------------------------------------------------
+# cortex 3g + neo4j 2.5g + sync 1g + nginx 128m ≈ 6.6 GB,
+# leaving ~1.4 GB for the OS and page cache.
+mem_limit_cortex: "3g"
+mem_limit_neo4j: "2560m"
+mem_limit_sync: "1g"
+mem_limit_nginx: "128m"
+neo4j_heap_max: "1G"
+neo4j_pagecache: "768M"
+
+# ------------------------------------------------------------
+# [VARS.SYNAPSE] Cortex users (passwords in vault.yml)
+# ------------------------------------------------------------
+# Rule texts are parsed by $lib.auth.ruleFromText() in playbook 04.3.
+synapse_users:
+  # Sync worker — write access to nodes/tags, nothing else.
+  - name: "engram-sync"
+    password_var: "vault_synapse_sync_password"
+    rules:
+      - "view.read"
+      - "node.add"
+      - "node.prop.set"
+      - "node.tag.add"
+      - "node.tag.del"
+      - "node.data.set"
+  # n8n + AI anomaly agent (future). Read everything, write ONLY
+  # tags under ai.* — the agent can annotate, never rewrite CTI
+  # facts or cs.* verdicts.
+  - name: "n8n-agent"
+    password_var: "vault_synapse_n8n_password"
+    rules:
+      - "view.read"
+      - "node.tag.add.ai"
+      - "node.tag.del.ai"
+  # Human analyst (Storm CLI / HTTP API) — manual verdicts (cs.fp).
+  - name: "analyst"
+    password_var: "vault_synapse_analyst_password"
+    rules:
+      - "view.read"
+      - "node.add"
+      - "node.prop.set"
+      - "node.tag.add"
+      - "node.tag.del"
+      - "node.data.set"
+
+# ------------------------------------------------------------
+# [VARS.CS_SOURCE] Cyber Sentinel read access (SSH tunnel + SQL)
+# ------------------------------------------------------------
+# Postgres on the Pi is NOT published on a host port. The sync
+# worker opens an SSH local forward to the Pi and reaches the
+# postgres_db container IP on Cyber Sentinel's internal network.
+cs_pg_container_ip: "10.10.10.9"
+cs_pg_port: 5432
+cs_pg_database: "cyber_intelligence"
+cs_pg_reader_user: "engram_reader"
+cs_tunnel_user: "engram-tunnel"
+
+# ------------------------------------------------------------
+# [VARS.SYNC] Worker behaviour
+# ------------------------------------------------------------
+# systemd timer: first run N minutes after boot, then every hour.
+engram_sync_on_boot: "5min"
+engram_sync_interval: "1h"
+
+# Verdict watermark overlap — rows re-read on every run so late
+# updates (scan_count / last_scan bumps) are not missed. Ingest is
+# idempotent, re-reading costs only time.
+engram_verdict_overlap_hours: 24
+engram_dns_overlap_days: 1
+
+# Blocklists: max runtime per run (resumable; state is committed
+# per batch). 0 = unlimited.
+engram_blocklist_max_minutes: 90
+engram_blocklist_batch: 2000
+# Limit number of lists (dev VM sets 5). 0 = all lists.
+engram_blocklist_limit: 0
+
+# Neo4j projection cap per query.
+engram_neo4j_max_nodes: 20000

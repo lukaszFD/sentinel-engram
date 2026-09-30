@@ -1,0 +1,7 @@
+ansible/.vault_pass
+ansible/group_vars/all/vault.yml
+ansible/host_vars/*/vault.yml
+engram_tunnel
+engram_tunnel.pub
+__pycache__/
+*.pyc

@@ -1,0 +1,16 @@
+# Sentinel Engram — sync schedule. Rendered by playbook 06.
+# The host is powered only a few hours per day: OnBootSec gives a
+# catch-up run shortly after every power-on, OnUnitActiveSec repeats
+# it while the host stays up. The worker is watermark-based, so a
+# run after a long gap simply processes more rows.
+[Unit]
+Description=Sentinel Engram sync schedule
+
+[Timer]
+OnBootSec={{ engram_sync_on_boot }}
+OnUnitActiveSec={{ engram_sync_interval }}
+RandomizedDelaySec=2min
+Unit={{ project_name }}-sync.service
+
+[Install]
+WantedBy=timers.target

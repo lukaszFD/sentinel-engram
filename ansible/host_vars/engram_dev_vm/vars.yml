@@ -1,0 +1,12 @@
+---
+# ============================================================
+# Sentinel Engram — host vars: engram_dev_vm (Proxmox dev VM)
+# ============================================================
+# Dev Engram reads from dev Cyber Sentinel — never from production.
+cs_source_host: "cs_dev_vm"
+
+engram_data_base: "/srv/sentinel-engram"
+
+# Dev VM has fewer resources than prod and does not need the full
+# multi-million blocklist ingest to test the pipeline end to end.
+engram_blocklist_limit: 5

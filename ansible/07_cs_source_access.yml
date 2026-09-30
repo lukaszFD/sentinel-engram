@@ -1,0 +1,183 @@
+---
+# ============================================================
+# Sentinel Engram — Playbook 07 — Cyber Sentinel Read Access
+# ============================================================
+# Purpose:    Grants Sentinel Engram read-only access to a Cyber
+#             Sentinel host. Runs against [cs_sources], NOT against
+#             Engram hosts, and is not imported by 00_main.yml.
+#
+#             1. SSH tunnel user `engram-tunnel`: key-only, no shell,
+#                no PTY, port forwarding allowed ONLY to
+#                postgres_db:5432 (permitopen) and ONLY from the Engram
+#                host(s) mapped to this source (from=).
+#             2. Postgres: role engram_reader + schema engram_export
+#                (config/cyber-sentinel/db_engram_export.sql).
+#
+# Why a tunnel: postgres_db is not published on a host port in
+#   Cyber Sentinel's compose, and Docker-published ports bypass UFW.
+#   The tunnel needs no change to Cyber Sentinel's compose file or
+#   firewall and encrypts the connection.
+#
+# Usage:
+#   ansible-playbook 07_cs_source_access.yml --limit cs_rpi5     # prod
+#   ansible-playbook 07_cs_source_access.yml --limit cs_dev_vm   # dev
+#
+# RE-RUN AFTER EVERY CYBER SENTINEL DEV DEPLOY: CS dev_vm is restored
+#   from backup, which removes both the tunnel user and the export
+#   schema. (Permanent fix: ship db_engram_export.sql through Cyber
+#   Sentinel's own 04.3b — see docs/cyber-sentinel-integration.md.)
+# ============================================================
+
+- name: 07 - Grant Sentinel Engram read access on Cyber Sentinel
+  hosts: cs_sources
+  become: yes
+
+  vars:
+    # Engram hosts that read from THIS Cyber Sentinel host.
+    engram_clients: >-
+      {{ groups['all_servers']
+         | map('extract', hostvars)
+         | selectattr('cs_source_host', 'defined')
+         | selectattr('cs_source_host', 'equalto', inventory_hostname)
+         | map(attribute='ansible_host')
+         | list }}
+    tunnel_key_options: >-
+      restrict,port-forwarding,permitopen="{{ cs_pg_container_ip }}:{{ cs_pg_port }}",from="{{ engram_clients | join(',') }}"
+    rendered_sql: "/root/engram_export_rendered.sql"
+
+  tasks:
+    # ============================================================
+    # SECTION 0 — Pre-flight
+    # ============================================================
+
+    - name: "[07.0.1] Assert secrets and client mapping are present"
+      ansible.builtin.assert:
+        that:
+          - vault_cs_tunnel_public_key | default('') | length > 0
+          - vault_cs_pg_reader_password | default('') | length > 0
+          - engram_clients | length > 0
+        fail_msg: >-
+          Missing vault_cs_tunnel_public_key / vault_cs_pg_reader_password, or no Engram host
+          has cs_source_host={{ inventory_hostname }} in host_vars.
+        quiet: true
+
+    - name: "[07.0.2] Show which Engram hosts get access"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} → tunnel allowed from {{ engram_clients | join(', ') }}"
+
+    - name: "[07.0.3] Verify postgres_db container is running"
+      ansible.builtin.command: docker inspect -f '{{ '{{' }}.State.Running{{ '}}' }}' postgres_db
+      register: pg_running
+      changed_when: false
+      failed_when: pg_running.stdout | trim != 'true'
+
+    # ============================================================
+    # SECTION 1 — SSH tunnel user
+    # ============================================================
+
+    - name: "[07.1.1] Create tunnel system user (no login shell)"
+      ansible.builtin.user:
+        name: "{{ cs_tunnel_user }}"
+        system: yes
+        shell: /usr/sbin/nologin
+        create_home: yes
+        password: "!"
+
+    # exclusive: any other key for this user is removed.
+    - name: "[07.1.2] Install restricted authorized_key"
+      ansible.posix.authorized_key:
+        user: "{{ cs_tunnel_user }}"
+        key: "{{ vault_cs_tunnel_public_key }}"
+        key_options: "{{ tunnel_key_options }}"
+        exclusive: yes
+        state: present
+
+    # The Pi's sshd is hardened (YubiKey MFA). Check the EFFECTIVE
+    # config for this user instead of assuming the tunnel will work:
+    # a global AuthenticationMethods requiring a second factor, a
+    # disabled TCP forwarding or an AllowUsers list would each break
+    # the tunnel silently. This only reports — it never edits sshd.
+    - name: "[07.1.3] Read effective sshd config for the tunnel user"
+      ansible.builtin.command: >-
+        sshd -T -C user={{ cs_tunnel_user }},host=engram,addr={{ engram_clients | first }}
+      register: sshd_effective
+      changed_when: false
+
+    - name: "[07.1.4] Parse sshd settings relevant to the tunnel"
+      ansible.builtin.set_fact:
+        sshd_fwd: "{{ sshd_effective.stdout | regex_search('(?m)^allowtcpforwarding (\\S+)', '\\1') | first }}"
+        sshd_auth: "{{ sshd_effective.stdout | regex_search('(?m)^authenticationmethods (.+)$', '\\1') | default(['any'], true) | first }}"
+        sshd_allowusers: "{{ sshd_effective.stdout | regex_findall('(?m)^allowusers (\\S+)') }}"
+
+    - name: "[07.1.5] Fail if sshd policy blocks the tunnel"
+      ansible.builtin.assert:
+        that:
+          - sshd_fwd in ['yes', 'all', 'local']
+          - sshd_auth in ['any', 'publickey'] or ('publickey' in (sshd_auth | split(' ')))
+          - sshd_allowusers | length == 0 or cs_tunnel_user in sshd_allowusers
+        fail_msg: >-
+          sshd on {{ inventory_hostname }} would reject the tunnel:
+          allowtcpforwarding={{ sshd_fwd }}, authenticationmethods={{ sshd_auth }},
+          allowusers={{ sshd_allowusers }}. Add a Match User {{ cs_tunnel_user }} block
+          at the END of /etc/ssh/sshd_config (not in sshd_config.d — Debian includes that
+          directory at the top, where a Match block would capture the rest of the file)
+          with: AuthenticationMethods publickey / AllowTcpForwarding local / PermitTTY no.
+        quiet: true
+
+    # ============================================================
+    # SECTION 2 — Postgres export schema + reader role
+    # ============================================================
+
+    - name: "[07.2.1] Render export SQL (contains reader password)"
+      ansible.builtin.template:
+        src: "{{ engram_repo_source_dir }}/config/cyber-sentinel/db_engram_export.sql"
+        dest: "{{ rendered_sql }}"
+        owner: root
+        mode: '0600'
+      no_log: true
+
+    - name: "[07.2.X] Apply export SQL"
+      block:
+        - name: "[07.2.2] Execute export SQL against postgres_db"
+          ansible.builtin.shell:
+            cmd: >-
+              docker exec -i postgres_db psql -U postgres -d {{ cs_pg_database }}
+              -v ON_ERROR_STOP=1 < {{ rendered_sql }}
+          register: export_sql
+          changed_when: false
+      always:
+        - name: "[07.2.3] Remove rendered SQL"
+          ansible.builtin.file:
+            path: "{{ rendered_sql }}"
+            state: absent
+
+    # Logs in as the reader over the container IP (127.0.0.1 is "trust"
+    # in the official postgres image pg_hba, so it would not test the
+    # password) — the same scram-sha-256 rule the tunnel hits — and
+    # reads both export objects.
+    - name: "[07.2.4] Verify reader can query both export objects"
+      ansible.builtin.command:
+        cmd: >-
+          docker exec -e PGPASSWORD={{ vault_cs_pg_reader_password | quote }} postgres_db
+          psql -h {{ cs_pg_container_ip }} -U {{ cs_pg_reader_user }} -d {{ cs_pg_database }} -At -c
+          "SELECT (SELECT count(*) FROM engram_export.v_verdicts) || ' verdicts, '
+               || (SELECT count(*) FROM engram_export.fn_dns_seen(now()::timestamp - interval '1 day')) || ' dns pairs (24h)';"
+      register: reader_check
+      changed_when: false
+      no_log: true
+
+    - name: "[07.2.5] Show export row counts"
+      ansible.builtin.debug:
+        msg: "engram_reader OK on {{ inventory_hostname }}: {{ reader_check.stdout }}"
+
+    # Read-only enforcement check: a write through the reader must fail.
+    - name: "[07.2.6] Verify reader session is read-only"
+      ansible.builtin.command:
+        cmd: >-
+          docker exec -e PGPASSWORD={{ vault_cs_pg_reader_password | quote }} postgres_db
+          psql -h {{ cs_pg_container_ip }} -U {{ cs_pg_reader_user }} -d {{ cs_pg_database }} -At -c
+          "SHOW default_transaction_read_only;"
+      register: ro_check
+      changed_when: false
+      failed_when: ro_check.stdout | trim != 'on'
+      no_log: true

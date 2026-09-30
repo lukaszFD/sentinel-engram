@@ -1,0 +1,42 @@
+---
+# ============================================================
+# Sentinel Engram — Playbook 04.4 — Neo4j Initialization
+# ============================================================
+# Purpose:    Applies constraints and indexes from
+#             config/neo4j/schema.cypher (mounted at /schema).
+#
+# NOTE: Neo4j Community has no role-based access control — every
+#       user is effectively admin. Neo4j is therefore NOT exposed to
+#       the n8n / AI agent; the agent talks to Synapse (least-privilege
+#       n8n-agent user). Neo4j stays a human visualization tool.
+# ============================================================
+
+- name: 04.4 - Initialize Neo4j
+  hosts: all_servers
+  become: yes
+  gather_facts: no
+
+  tasks:
+    - name: "[04.4.1.1] Apply Neo4j schema (constraints + indexes)"
+      ansible.builtin.command:
+        cmd: >-
+          docker exec engram-neo4j cypher-shell
+          -a bolt://localhost:7687 -u neo4j -p {{ vault_neo4j_password | quote }}
+          -f /schema/schema.cypher
+      register: neo4j_schema
+      until: neo4j_schema.rc == 0
+      retries: 10
+      delay: 10
+      changed_when: false
+      no_log: true
+
+    - name: "[04.4.1.2] Verify constraints exist"
+      ansible.builtin.command:
+        cmd: >-
+          docker exec engram-neo4j cypher-shell
+          -a bolt://localhost:7687 -u neo4j -p {{ vault_neo4j_password | quote }}
+          --format plain "SHOW CONSTRAINTS YIELD name RETURN count(name)"
+      register: neo4j_constraints
+      changed_when: false
+      failed_when: neo4j_constraints.rc != 0 or (neo4j_constraints.stdout_lines | last | int) < 5
+      no_log: true

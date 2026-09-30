@@ -1,0 +1,42 @@
+---
+# ============================================================
+# Sentinel Engram — Secrets template
+# ============================================================
+# Copy to vault.yml, fill in, then:
+#   ansible-vault encrypt group_vars/all/vault.yml
+# Never commit the decrypted file.
+# ============================================================
+
+# --- Synapse Cortex ---
+vault_synapse_root_password: ""
+vault_synapse_sync_password: ""
+vault_synapse_n8n_password: ""
+vault_synapse_analyst_password: ""
+# Leave undefined on first run. Playbook 04.3 generates the API key
+# for n8n-agent, prints it ONCE — then save it here so re-runs do
+# not mint another key.
+# vault_synapse_n8n_apikey: ""
+
+# --- Neo4j ---
+vault_neo4j_password: ""
+
+# --- Cyber Sentinel read access ---
+vault_cs_pg_reader_password: ""
+# Dedicated ed25519 key pair for the SSH tunnel to the Pi:
+#   ssh-keygen -t ed25519 -N '' -C engram-tunnel -f engram_tunnel
+vault_cs_tunnel_private_key: |
+  -----BEGIN OPENSSH PRIVATE KEY-----
+  ...
+  -----END OPENSSH PRIVATE KEY-----
+vault_cs_tunnel_public_key: "ssh-ed25519 AAAA... engram-tunnel"
+
+# --- TLS (one pair per Nginx vhost) ---
+vault_cortex_cert: ""
+vault_cortex_key: ""
+vault_neo4j_cert: ""
+vault_neo4j_key: ""
+
+# --- Proxmox (dev VM restore; same token as Cyber Sentinel) ---
+proxmox_host: ""
+proxmox_user_token: ""      # user@realm!tokenid
+proxmox_api_secret: ""

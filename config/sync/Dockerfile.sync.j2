@@ -1,0 +1,30 @@
+# ============================================================
+# Sentinel Engram — sync worker image
+# ============================================================
+# Base image pinned by digest via group_vars (image_python).
+# openssh-client: the worker opens its own SSH tunnel to the Cyber
+# Sentinel host for the duration of a run.
+# Runs as non-root UID 10001 (matches ownership set in 01 / 04.1).
+# ============================================================
+FROM {{ image_python }}
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-client \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd -g 10001 engram \
+ && useradd -u 10001 -g 10001 -m -s /usr/sbin/nologin engram
+
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install -r /app/requirements.txt
+
+COPY engram_sync.py /app/engram_sync.py
+
+USER 10001
+ENTRYPOINT ["python", "/app/engram_sync.py"]
+CMD ["all"]

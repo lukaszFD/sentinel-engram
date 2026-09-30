@@ -1,0 +1,203 @@
+---
+# ============================================================
+# Sentinel Engram — Playbook 00.PRE.RESTORE — Proxmox VM Restore
+# ============================================================
+# Purpose:    Restores the Engram dev VM from its latest Proxmox
+#             backup before deployment, so every dev deploy starts
+#             from a known-good baseline (same model as Cyber
+#             Sentinel's restore_proxmox.yml).
+#
+# Trigger:    Runs ONLY when --limit targets engram-dev or
+#             engram_dev_vm (or no --limit at all).
+#               00_main.yml --limit engram-dev   → RUNS
+#               00_main.yml --limit engram-prod  → SKIPS
+#
+# Depends on: - engram_dev_vm_id defined (group_vars) — no default
+#             - proxmox_host / proxmox_user_token / proxmox_api_secret
+#               in vault.yml
+#             - community.general collection
+#             - At least one vzdump backup of engram_dev_vm_id in
+#               backup_storage
+#
+# NOTE: restoring the dev VM wipes Cortex/Neo4j data on it. The
+#       sync worker rebuilds the graph from Cyber Sentinel dev on
+#       the first timer run (playbook 06).
+# ============================================================
+
+- name: 00.PRE.RESTORE - Proxmox Snapshot Restore (Engram DEV VM only)
+  hosts: all_servers
+  gather_facts: no
+
+  vars:
+    should_restore: false
+
+  tasks:
+    # ============================================================
+    # SECTION 0 — Gate
+    # ============================================================
+
+    - name: "[00.PRE.RESTORE.0.1] Determine if restore should run"
+      ansible.builtin.set_fact:
+        should_restore: >-
+          {{ (ansible_limit is not defined)
+             or (ansible_limit | default('') == '')
+             or ('engram-dev' in (ansible_limit | default('') | split(',')))
+             or ('engram_dev_vm' in (ansible_limit | default('') | split(','))) }}
+      run_once: true
+      delegate_to: localhost
+
+    - name: "[00.PRE.RESTORE.0.2] Skip rest of play if not targeting engram-dev"
+      ansible.builtin.meta: end_play
+      when: not should_restore
+
+    # A wrong VMID would overwrite an unrelated VM — never guess it.
+    - name: "[00.PRE.RESTORE.0.3] Assert engram_dev_vm_id is set"
+      ansible.builtin.assert:
+        that:
+          - engram_dev_vm_id is defined
+          - engram_dev_vm_id | string | length > 0
+        fail_msg: "Set engram_dev_vm_id in group_vars/all/all_servers.yml to the VMID of the Engram dev VM."
+        quiet: true
+      run_once: true
+      delegate_to: localhost
+
+    - name: "[00.PRE.RESTORE.0.4] Announce restore intent"
+      ansible.builtin.debug:
+        msg:
+          - "==========================================================="
+          - "  PROXMOX RESTORE — engram-dev (VMID {{ engram_dev_vm_id }})"
+          - "==========================================================="
+          - "  Proxmox node:   {{ proxmox_node }}"
+          - "  Source storage: {{ backup_storage }}"
+          - "  Strategy:       latest backup, by ctime"
+          - "  This will OVERWRITE the current VM state."
+          - "==========================================================="
+      run_once: true
+      delegate_to: localhost
+
+    # ============================================================
+    # SECTION 1 — Discover latest backup
+    # ============================================================
+
+    - name: "[00.PRE.RESTORE.1.1] Get list of backups from Proxmox storage"
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/storage/{{ backup_storage }}/content"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_user_token }}={{ proxmox_api_secret }}"
+        validate_certs: false
+      register: backup_list
+      run_once: true
+      delegate_to: localhost
+
+    # Trailing '-' anchors the VMID: without it VMID 10 would also
+    # match backups of VMID 100, 101, ...
+    - name: "[00.PRE.RESTORE.1.2] Filter backups for VMID {{ engram_dev_vm_id }}"
+      ansible.builtin.set_fact:
+        vm_backups: >-
+          {{ backup_list.json.data
+             | selectattr('content', 'equalto', 'backup')
+             | selectattr('volid', 'search', 'vzdump-qemu-' ~ engram_dev_vm_id ~ '-')
+             | list }}
+      run_once: true
+      delegate_to: localhost
+
+    - name: "[00.PRE.RESTORE.1.3] Fail fast if no backups found"
+      ansible.builtin.fail:
+        msg: "No backups found for VMID {{ engram_dev_vm_id }} in storage {{ backup_storage }}."
+      when: vm_backups | length == 0
+      run_once: true
+      delegate_to: localhost
+
+    - name: "[00.PRE.RESTORE.1.4] Pick latest backup by creation time"
+      ansible.builtin.set_fact:
+        latest_backup: "{{ vm_backups | sort(attribute='ctime', reverse=true) | first }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: "[00.PRE.RESTORE.1.5] Display selected backup"
+      ansible.builtin.debug:
+        msg:
+          - "Selected: {{ latest_backup.volid }}"
+          - "Created:  {{ '%Y-%m-%d %H:%M:%S' | strftime(latest_backup.ctime) }}"
+      run_once: true
+      delegate_to: localhost
+
+    # ============================================================
+    # SECTION 2 — Stop, restore, wait
+    # ============================================================
+
+    - name: "[00.PRE.RESTORE.2.1] Stop VM {{ engram_dev_vm_id }} before restore"
+      community.general.proxmox_kvm:
+        api_host: "{{ proxmox_host }}"
+        api_user: "{{ proxmox_user_token.split('!')[0] }}"
+        api_token_id: "{{ proxmox_user_token.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_api_secret }}"
+        vmid: "{{ engram_dev_vm_id }}"
+        state: stopped
+        validate_certs: false
+      run_once: true
+      delegate_to: localhost
+
+    - name: "[00.PRE.RESTORE.2.2] Trigger restore from {{ latest_backup.volid }}"
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu"
+        method: POST
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_user_token }}={{ proxmox_api_secret }}"
+        body_format: form-urlencoded
+        body:
+          vmid: "{{ engram_dev_vm_id }}"
+          archive: "{{ latest_backup.volid }}"
+          force: 1
+        validate_certs: false
+        status_code: 200
+      register: restore_result
+      run_once: true
+      delegate_to: localhost
+
+    - name: "[00.PRE.RESTORE.2.3] Wait for restore task to complete"
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/tasks/{{ restore_result.json.data }}/status"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_user_token }}={{ proxmox_api_secret }}"
+        validate_certs: false
+      register: task_status
+      until: task_status.json.data.status == 'stopped'
+      retries: 60
+      delay: 10
+      run_once: true
+      delegate_to: localhost
+
+    - name: "[00.PRE.RESTORE.2.4] Verify restore exitstatus is OK"
+      ansible.builtin.fail:
+        msg: "Restore task ended with non-OK status: {{ task_status.json.data.exitstatus }}"
+      when: task_status.json.data.exitstatus != 'OK'
+      run_once: true
+      delegate_to: localhost
+
+    # ============================================================
+    # SECTION 3 — Boot restored VM
+    # ============================================================
+
+    - name: "[00.PRE.RESTORE.3.1] Start VM after restore"
+      community.general.proxmox_kvm:
+        api_host: "{{ proxmox_host }}"
+        api_user: "{{ proxmox_user_token.split('!')[0] }}"
+        api_token_id: "{{ proxmox_user_token.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_api_secret }}"
+        vmid: "{{ engram_dev_vm_id }}"
+        state: started
+        validate_certs: false
+      run_once: true
+      delegate_to: localhost
+
+    - name: "[00.PRE.RESTORE.3.2] Wait for SSH on engram_dev_vm"
+      ansible.builtin.wait_for:
+        host: "{{ hostvars[groups['engram-dev'][0]]['ansible_host'] }}"
+        port: 22
+        delay: 15
+        timeout: 180
+      run_once: true
+      delegate_to: localhost
