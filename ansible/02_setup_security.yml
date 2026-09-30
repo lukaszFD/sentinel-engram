@@ -1,0 +1,49 @@
+---
+# ============================================================
+# Sentinel Engram — Playbook 02 — Firewall Configuration (UFW)
+# ============================================================
+# Purpose:    Default-deny incoming; only SSH and Nginx are open.
+#             Cortex (4443/27492) and Neo4j (7474/7687) are never
+#             published on LAN interfaces — they are reachable only
+#             through Nginx (playbook 05). Cortex HTTPS is bound to
+#             127.0.0.1 for Ansible (playbook 04.3).
+#
+# NOTE: Docker-published ports bypass UFW (Docker writes its own
+#       iptables rules). That is why the compose file publishes
+#       Cortex on 127.0.0.1 only instead of relying on UFW.
+# ============================================================
+
+- name: 02 - Configure Firewall (UFW)
+  hosts: all_servers
+  become: yes
+  vars:
+    allow_ports:
+      - { port: 22,  proto: "tcp", comment: "SSH Management" }
+      - { port: 80,  proto: "tcp", comment: "Nginx HTTP Redirect" }
+      - { port: 443, proto: "tcp", comment: "Nginx HTTPS (Cortex API, Neo4j Browser + Bolt/WS)" }
+
+  tasks:
+    - name: "[02.1.1] Install UFW package"
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+        update_cache: yes
+
+    # Order: reset → allow → enable. Enabling before allow would cut
+    # off SSH for every following play.
+    - name: "[02.2.1] Reset UFW to default state"
+      community.general.ufw:
+        state: reset
+
+    - name: "[02.2.2] Allow ports defined in allow_ports"
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port | string }}"
+        proto: "{{ item.proto }}"
+        comment: "{{ item.comment }}"
+      loop: "{{ allow_ports }}"
+
+    - name: "[02.2.3] Enable UFW with default-deny incoming policy"
+      community.general.ufw:
+        state: enabled
+        policy: deny

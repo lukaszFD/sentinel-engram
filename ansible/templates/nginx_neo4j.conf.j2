@@ -1,0 +1,56 @@
+# Sentinel Engram — neo4j.{{ domain_suffix }} → Neo4j Browser (HTTP) + Bolt over WebSocket
+# Rendered by playbook 05. Do not edit on host.
+#
+# One public endpoint (443) for both protocols:
+#   - normal HTTP requests      → Neo4j HTTP connector (7474, Browser UI)
+#   - WebSocket upgrade request → Neo4j Bolt connector (7687)
+# The Browser connects to bolt+s://neo4j.{{ domain_suffix }}:443, which
+# matches server.bolt.advertised_address set in docker compose.
+
+map $http_upgrade $neo4j_upstream_port {
+    default    {{ item.port }};
+    websocket  {{ item.bolt_port }};
+}
+
+map $http_upgrade $neo4j_connection_upgrade {
+    default    "";
+    websocket  upgrade;
+}
+
+server {
+    listen 80;
+    server_name {{ item.name }}.{{ domain_suffix }};
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name {{ item.name }}.{{ domain_suffix }};
+
+    ssl_certificate     /etc/nginx/certs/{{ item.name }}.crt;
+    ssl_certificate_key /etc/nginx/certs/{{ item.name }}.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    resolver 127.0.0.11 valid=30s;
+
+    location / {
+        set $upstream_host {{ item.internal_host }};
+        proxy_pass http://$upstream_host:$neo4j_upstream_port;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $neo4j_connection_upgrade;
+
+        # Idle Bolt sessions in the Browser must not be cut after 60s.
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}

@@ -1,0 +1,158 @@
+---
+# ============================================================
+# Sentinel Engram — Playbook 03 — System Setup (x86_64)
+# ============================================================
+# Purpose:    Docker Engine + Compose plugin, Python libs for Ansible
+#             Docker modules, kernel tuning recommended by the
+#             Synapse Devops Guide (LMDB is memory-mapped), and a
+#             storage sanity check for the data directory.
+#
+# Target:     ZimaBoard 2 (Intel N150) and the Proxmox dev VM — both
+#             x86_64. The Synapse Cortex image is published for
+#             linux/amd64 only; this playbook fails fast on anything
+#             else instead of letting the image pull fail later.
+# ============================================================
+
+- name: 03 - Setup System (x86_64)
+  hosts: all_servers
+  become: yes
+
+  vars:
+    # Synapse Devops Guide — "Performance Tuning" (kernel parameters).
+    synapse_sysctl:
+      vm.swappiness: 10
+      vm.dirty_expire_centisecs: 20
+      vm.dirty_writeback_centisecs: 20
+      vm.dirty_background_ratio: 2
+      vm.dirty_ratio: 4
+
+  tasks:
+    # ============================================================
+    # SECTION 0 — Architecture gate
+    # ============================================================
+
+    - name: "[03.0.1] Assert x86_64 architecture (Synapse images are amd64-only)"
+      ansible.builtin.assert:
+        that: ansible_architecture == "x86_64"
+        fail_msg: "Sentinel Engram requires x86_64 — vertexproject/synapse-cortex is published for linux/amd64 only."
+        quiet: true
+
+    # ============================================================
+    # SECTION 1 — Base packages
+    # ============================================================
+
+    - name: "[03.1.1] Install prerequisite and monitoring packages"
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - python3-docker          # community.docker.* modules
+          - htop
+          - smartmontools           # SATA SSD health
+          - fail2ban
+          - jq
+        state: present
+        update_cache: yes
+
+    # ============================================================
+    # SECTION 2 — Docker Engine
+    # ============================================================
+
+    - name: "[03.2.1] Create directory for Docker GPG key"
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: "[03.2.2] Add Docker official GPG key"
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/debian/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+
+    - name: "[03.2.3] Add Docker APT repository"
+      ansible.builtin.apt_repository:
+        repo: >
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/debian
+          {{ ansible_distribution_release }}
+          stable
+        state: present
+
+    - name: "[03.2.4] Install Docker Engine and Compose plugin"
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: "[03.2.5] Add ansible_user to docker group"
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+
+    - name: "[03.2.6] Reset connection to apply docker group membership"
+      ansible.builtin.meta: reset_connection
+
+    - name: "[03.2.7] Verify Docker installation"
+      ansible.builtin.command: docker --version
+      register: docker_version
+      changed_when: false
+
+    # ============================================================
+    # SECTION 3 — Kernel tuning for Synapse (LMDB)
+    # ============================================================
+
+    - name: "[03.3.1] Apply Synapse-recommended sysctl values (persistent)"
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/60-sentinel-engram.conf
+        reload: yes
+      loop: "{{ synapse_sysctl | dict2items }}"
+
+    # ============================================================
+    # SECTION 4 — Data directory + storage check
+    # ------------------------------------------------------------
+    # Warns (does not fail) when the data dir sits on eMMC. The
+    # ZimaBoard 2 832 has 32 GB eMMC; the full blocklist graph plus
+    # Synapse's backup headroom (the Devops Guide recommends keeping
+    # usage under 50% of the volume) will not fit there.
+    # ============================================================
+
+    - name: "[03.4.1] Create data base directory"
+      ansible.builtin.file:
+        path: "{{ engram_data_base }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: "[03.4.2] Resolve block device backing the data directory"
+      ansible.builtin.command: "findmnt -no SOURCE --target {{ engram_data_base }}"
+      register: data_dev
+      changed_when: false
+
+    - name: "[03.4.3] Warn if data directory is on eMMC"
+      ansible.builtin.debug:
+        msg:
+          - "WARNING: {{ engram_data_base }} is on {{ data_dev.stdout }} (eMMC)."
+          - "Mount the SATA SSD there (or change engram_data_base in host_vars)"
+          - "before the first blocklist sync."
+      when: "'mmcblk' in data_dev.stdout"
+
+    - name: "[03.4.4] Report free space on data volume"
+      ansible.builtin.command: "df -h --output=size,avail,pcent {{ engram_data_base }}"
+      register: data_df
+      changed_when: false
+
+    - name: "[03.4.5] Show data volume usage"
+      ansible.builtin.debug:
+        msg: "{{ data_df.stdout_lines }}"

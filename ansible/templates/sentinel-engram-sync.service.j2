@@ -1,0 +1,17 @@
+# Sentinel Engram — sync worker (one run). Rendered by playbook 06.
+# Pipeline: Cyber Sentinel verdicts + DNS → Pi-hole blocklists → Cortex → Neo4j
+[Unit]
+Description=Sentinel Engram sync (Cyber Sentinel + blocklists -> Synapse -> Neo4j)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory={{ remote_deploy_base }}
+ExecStart=/usr/bin/docker compose -f docker-compose-{{ project_name }}.yml -p {{ project_name }} --profile sync run --rm engram-sync all
+# Blocklist phase stops itself after engram_blocklist_max_minutes;
+# the extra hour covers verdicts, DNS and the Neo4j projection.
+TimeoutStartSec={{ (engram_blocklist_max_minutes | int) + 60 }}min
+Nice=10
+IOSchedulingClass=idle

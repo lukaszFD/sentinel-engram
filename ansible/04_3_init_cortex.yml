@@ -1,0 +1,162 @@
+---
+# ============================================================
+# Sentinel Engram — Playbook 04.3 — Synapse Cortex Initialization
+# ============================================================
+# Purpose:    Creates Cortex users with least-privilege rules and
+#             mints the API key for the future n8n / AI anomaly agent.
+#
+# Users (definitions: group_vars synapse_users):
+#   engram-sync  — sync worker (node/tag writes)
+#   n8n-agent    — read-only + write ONLY ai.* tags; API key auth
+#   analyst      — manual analysis (Storm CLI / HTTP API)
+#
+# Access:     Cortex HTTPS on 127.0.0.1:4443 (loopback-published in
+#             compose), root via HTTP basic auth. validate_certs is
+#             off because the Cortex cert is self-signed and the
+#             connection never leaves the host.
+#
+# Idempotency:
+#   - Users: upsert (create if missing, reset password + rules).
+#   - n8n API key: minted ONLY when vault_synapse_n8n_apikey is not
+#     defined, printed ONCE — same convention as the n8n Vault token
+#     in Cyber Sentinel 06.1. Save it to vault.yml afterwards.
+#
+# Storm queries below contain no interpolated user data — every
+# value is passed through opts.vars.
+# ============================================================
+
+- name: 04.3 - Initialize Synapse Cortex
+  hosts: all_servers
+  become: yes
+  gather_facts: no
+
+  vars:
+    cortex_api: "https://127.0.0.1:4443/api/v1"
+
+    storm_upsert_user: |
+      $u = $lib.auth.users.byname($name)
+      if (not $u) { $u = $lib.auth.users.add($name) }
+      $u.setPasswd($passwd)
+      $rules = ([])
+      for $r in $ruletexts { $rules.append($lib.auth.ruleFromText($r)) }
+      $u.setRules($rules)
+      return($u.iden)
+
+    storm_gen_apikey: |
+      $u = $lib.auth.users.byname($name)
+      ($key, $info) = $u.genApiKey($keyname)
+      return($key)
+
+  tasks:
+    # ============================================================
+    # SECTION 1 — Readiness
+    # ============================================================
+
+    - name: "[04.3.1.1] Wait for Cortex HTTPS API (/api/v1/active)"
+      ansible.builtin.uri:
+        url: "{{ cortex_api }}/active"
+        validate_certs: false
+      register: cortex_active
+      until: cortex_active.status == 200 and (cortex_active.json.result.active | default(false))
+      retries: 30
+      delay: 5
+
+    - name: "[04.3.1.2] Verify root credentials"
+      ansible.builtin.uri:
+        url: "{{ cortex_api }}/storm/call"
+        method: GET
+        url_username: root
+        url_password: "{{ vault_synapse_root_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          query: "return($lib.user.name())"
+      register: root_check
+      failed_when: root_check.json.status | default('') != 'ok'
+      no_log: true
+
+    # ============================================================
+    # SECTION 2 — Users and rules
+    # ============================================================
+
+    - name: "[04.3.2.1] Upsert Cortex users with least-privilege rules"
+      ansible.builtin.uri:
+        url: "{{ cortex_api }}/storm/call"
+        method: GET
+        url_username: root
+        url_password: "{{ vault_synapse_root_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          query: "{{ storm_upsert_user }}"
+          opts:
+            vars:
+              name: "{{ item.name }}"
+              passwd: "{{ lookup('vars', item.password_var) }}"
+              ruletexts: "{{ item.rules }}"
+      register: user_upsert
+      failed_when: user_upsert.json.status | default('') != 'ok'
+      changed_when: false
+      loop: "{{ synapse_users }}"
+      loop_control:
+        label: "{{ item.name }}"
+      no_log: true
+
+    - name: "[04.3.2.2] Smoke test — authenticate as engram-sync"
+      ansible.builtin.uri:
+        url: "{{ cortex_api }}/storm/call"
+        method: GET
+        url_username: "engram-sync"
+        url_password: "{{ vault_synapse_sync_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          query: "return($lib.user.name())"
+      register: sync_check
+      failed_when: (sync_check.json.result | default('')) != 'engram-sync'
+      no_log: true
+
+    # ============================================================
+    # SECTION 3 — n8n-agent API key (shown once)
+    # ============================================================
+
+    - name: "[04.3.3.1] Mint API key for n8n-agent (only if not saved in vault.yml)"
+      ansible.builtin.uri:
+        url: "{{ cortex_api }}/storm/call"
+        method: GET
+        url_username: root
+        url_password: "{{ vault_synapse_root_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          query: "{{ storm_gen_apikey }}"
+          opts:
+            vars:
+              name: "n8n-agent"
+              keyname: "n8n-{{ inventory_hostname }}"
+      register: n8n_apikey
+      when: vault_synapse_n8n_apikey is not defined or vault_synapse_n8n_apikey | length == 0
+      failed_when: n8n_apikey.json.status | default('') != 'ok'
+      no_log: true
+
+    - name: "[04.3.3.2] Display n8n-agent API key (SAVE THIS NOW — shown only once)"
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "  SYNAPSE API KEY — n8n-agent @ {{ inventory_hostname }}"
+          - "============================================================"
+          - "  Key:  {{ n8n_apikey.json.result }}"
+          - ""
+          - "  Header:   X-API-KEY: <key>"
+          - "  Endpoint: https://cortex.{{ domain_suffix }}/api/v1/storm/call"
+          - "  Rights:   view.read + node.tag.add/del under ai.* only"
+          - ""
+          - "  ACTION REQUIRED: add to vault.yml (per host if dev and"
+          - "  prod keys should differ) so re-runs do not mint another:"
+          - "    vault_synapse_n8n_apikey: \"<key above>\""
+          - "============================================================"
+      when: n8n_apikey is not skipped

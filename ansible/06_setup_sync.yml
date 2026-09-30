@@ -1,0 +1,79 @@
+---
+# ============================================================
+# Sentinel Engram — Playbook 06 — Sync Scheduling
+# ============================================================
+# Purpose:    Installs the systemd service + timer that run the sync
+#             worker, then runs a first quick pass (verdicts, DNS,
+#             Neo4j projection) to prove the pipeline end to end.
+#             The blocklist phase is left to the timer — the initial
+#             ingest of all Pi-hole lists takes hours on an N150 and
+#             is resumable across runs.
+#
+# Depends on: 04.2 (sync image built), 04.3 (engram-sync user),
+#             07_cs_source_access.yml already run against the matching
+#             cs_sources host (SSH tunnel user + engram_reader role).
+#             Without it the first pass fails at the tunnel step —
+#             that is reported, not fatal (see [06.2.2]).
+# ============================================================
+
+- name: 06 - Sync scheduling
+  hosts: all_servers
+  become: yes
+
+  vars:
+    unit_name: "{{ project_name }}-sync"
+
+  tasks:
+    # ============================================================
+    # SECTION 1 — systemd units
+    # ============================================================
+
+    - name: "[06.1.1] Install sync service unit"
+      ansible.builtin.template:
+        src: "templates/sentinel-engram-sync.service.j2"
+        dest: "/etc/systemd/system/{{ unit_name }}.service"
+        mode: '0644'
+      notify: Reload systemd
+
+    - name: "[06.1.2] Install sync timer unit"
+      ansible.builtin.template:
+        src: "templates/sentinel-engram-sync.timer.j2"
+        dest: "/etc/systemd/system/{{ unit_name }}.timer"
+        mode: '0644'
+      notify: Reload systemd
+
+    - name: "[06.1.3] Flush handlers (daemon-reload before enabling)"
+      ansible.builtin.meta: flush_handlers
+
+    - name: "[06.1.4] Enable and start sync timer"
+      ansible.builtin.systemd:
+        name: "{{ unit_name }}.timer"
+        enabled: yes
+        state: started
+
+    # ============================================================
+    # SECTION 2 — First quick pass
+    # ============================================================
+
+    - name: "[06.2.1] Run first sync pass (verdicts, dns, project)"
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f docker-compose-{{ project_name }}.yml -p {{ project_name }}
+          --profile sync run --rm engram-sync verdicts dns project
+        chdir: "{{ remote_deploy_base }}"
+      register: first_sync
+      failed_when: false
+      changed_when: first_sync.rc == 0
+
+    - name: "[06.2.2] Report first sync result"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'First sync OK.' if first_sync.rc == 0 else
+             'First sync FAILED (rc=' ~ first_sync.rc ~ '). If the error mentions the SSH tunnel or '
+             ~ 'engram_reader, run 07_cs_source_access.yml --limit ' ~ cs_source_host
+             ~ ' and re-run this playbook. Last lines: ' ~ (first_sync.stderr_lines[-5:] | default([])) | join(' | ') }}
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: yes

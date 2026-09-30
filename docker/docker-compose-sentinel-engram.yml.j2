@@ -1,0 +1,148 @@
+# ============================================================
+# Sentinel Engram — Docker Compose (Jinja2 template)
+# ============================================================
+# Rendered by playbook 04.1. Images are pinned tag@digest from
+# group_vars (never `latest`). Project name: {{ project_name }}.
+#
+# Services:
+#   engram-cortex  Vertex Synapse Cortex v2 — CTI hypergraph, Storm, HTTP API
+#   engram-neo4j   Neo4j Community — visual projection of the Synapse graph
+#   engram-sync    One-shot worker (profile "sync"), started by the
+#                  systemd timer from playbook 06:
+#                    Cyber Sentinel Postgres + Pi-hole blocklists → Cortex → Neo4j
+#
+# Nginx is started by playbook 05 on the same network (same model
+# as Cyber Sentinel's nginx-proxy).
+# ============================================================
+
+name: {{ project_name }}
+
+services:
+
+  # ------------------------------------------------------------
+  # [SVC.CORTEX] Vertex Synapse Cortex
+  # ------------------------------------------------------------
+  # HTTPS API on 4443 with a self-signed cert generated on first
+  # start; Nginx terminates the public TLS in front of it.
+  # Published on 127.0.0.1 only — used by Ansible (04.3) on the host.
+  # Docker-published ports bypass UFW, so binding to loopback is the
+  # actual access control here.
+  engram-cortex:
+    image: {{ image_synapse_cortex }}
+    container_name: engram-cortex
+    user: "999"
+    restart: unless-stopped
+    mem_limit: {{ mem_limit_cortex }}
+    environment:
+      # Bootstraps the root password on first start (local only).
+      SYN_CORTEX_AUTH_PASSWD: ${SYNAPSE_ROOT_PASSWORD}
+      SYN_CORTEX_HTTPS_PORT: "4443"
+      # Nexus change log is required only for mirroring. Single
+      # Cortex, no mirror — disabled to save SSD space and writes.
+      SYN_CORTEX_NEXSLOG_EN: "false"
+      # Go read-only below 10% free disk instead of corrupting on ENOSPC.
+      SYN_CORTEX_LIMIT_DISK_FREE: "10"
+      # Behind Nginx: log the real client IP from X-Forwarded-For.
+      SYN_CORTEX_HTTPS_PARSE_PROXY_REMOTEIP: "true"
+      # Audit trail of every Storm query (sync worker, n8n agent, analyst).
+      SYN_CORTEX_STORM_LOG: "true"
+      SYN_LOG_LEVEL: "INFO"
+      SYN_LOG_STRUCT: "true"
+    volumes:
+      - {{ engram_data_base }}/cortex:/vertex/storage
+    ports:
+      - "127.0.0.1:4443:4443"
+    networks:
+      internal_network:
+        ipv4_address: {{ engram_ip_cortex }}
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import ssl,urllib.request;urllib.request.urlopen('https://127.0.0.1:4443/api/v1/active',context=ssl._create_unverified_context(),timeout=5)"
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  # ------------------------------------------------------------
+  # [SVC.NEO4J] Neo4j Community — visualization layer
+  # ------------------------------------------------------------
+  # Browser (7474) and Bolt (7687) are reached only through Nginx:
+  # https://neo4j.{{ domain_suffix }} serves the Browser, and the
+  # Bolt WebSocket upgrade on the same host:443 is routed to 7687.
+  # bolt advertised address must match that public endpoint, or the
+  # Browser will try to connect to the container's internal address.
+  engram-neo4j:
+    image: {{ image_neo4j }}
+    container_name: engram-neo4j
+    restart: unless-stopped
+    mem_limit: {{ mem_limit_neo4j }}
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_server_memory_heap_initial__size: "{{ neo4j_heap_max }}"
+      NEO4J_server_memory_heap_max__size: "{{ neo4j_heap_max }}"
+      NEO4J_server_memory_pagecache_size: "{{ neo4j_pagecache }}"
+      NEO4J_server_bolt_advertised__address: "neo4j.{{ domain_suffix }}:443"
+      NEO4J_dbms_usage__report_enabled: "false"
+    volumes:
+      - {{ engram_data_base }}/neo4j/data:/data
+      - {{ engram_data_base }}/neo4j/logs:/logs
+      - {{ remote_deploy_base }}/config/neo4j:/schema:ro
+    networks:
+      internal_network:
+        ipv4_address: {{ engram_ip_neo4j }}
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -a bolt://localhost:7687 -u neo4j -p \"$${NEO4J_AUTH#neo4j/}\" 'RETURN 1' >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  # ------------------------------------------------------------
+  # [SVC.SYNC] Sync worker — one-shot, profile "sync"
+  # ------------------------------------------------------------
+  # Not started by `docker compose up`. Run by systemd:
+  #   docker compose -p {{ project_name }} --profile sync run --rm engram-sync all
+  # Opens an SSH local forward to the Cyber Sentinel host for the
+  # duration of the run only (see engram_sync.py → PgTunnel).
+  engram-sync:
+    profiles: ["sync"]
+    build:
+      context: ./sync
+      dockerfile: Dockerfile.sync
+    image: {{ project_name }}/sync:local
+    container_name: engram-sync
+    restart: "no"
+    mem_limit: {{ mem_limit_sync }}
+    env_file: .env
+    environment:
+      CORTEX_URL: "https://engram-cortex:4443"
+      NEO4J_URI: "bolt://engram-neo4j:7687"
+      STATE_DIR: "/state"
+      BLOCKLIST_FILE: "/config/blocklists.txt"
+      VERDICT_OVERLAP_HOURS: "{{ engram_verdict_overlap_hours }}"
+      DNS_OVERLAP_DAYS: "{{ engram_dns_overlap_days }}"
+      BLOCKLIST_MAX_MINUTES: "{{ engram_blocklist_max_minutes }}"
+      BLOCKLIST_BATCH: "{{ engram_blocklist_batch }}"
+      BLOCKLIST_LIMIT: "{{ engram_blocklist_limit }}"
+      NEO4J_MAX_NODES: "{{ engram_neo4j_max_nodes }}"
+    volumes:
+      - {{ engram_data_base }}/sync_state:/state
+      - {{ remote_deploy_base }}/secrets/cs_tunnel_key:/secrets/cs_tunnel_key:ro
+      - {{ remote_deploy_base }}/sync/blocklists.txt:/config/blocklists.txt:ro
+    networks:
+      - internal_network
+    depends_on:
+      engram-cortex:
+        condition: service_healthy
+      engram-neo4j:
+        condition: service_healthy
+
+networks:
+  internal_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: {{ engram_network_subnet }}

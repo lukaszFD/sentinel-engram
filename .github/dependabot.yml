@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # Python dependencies — sync worker (config/sync/requirements.txt)
+  - package-ecosystem: "pip"
+    directory: "/config/sync"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "chore(ci)"
+
+  # Docker ecosystem intentionally not configured: every image is
+  # pinned tag@digest in ansible/group_vars/all/all_servers.yml and
+  # rendered into Jinja2 templates (Dockerfile.sync.j2, compose .j2).
+  # Dependabot cannot parse either, so a "docker" entry here would
+  # only report errors. Image updates are reviewed manually.

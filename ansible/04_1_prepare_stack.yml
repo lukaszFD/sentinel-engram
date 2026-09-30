@@ -1,0 +1,121 @@
+---
+# ============================================================
+# Sentinel Engram — Playbook 04.1 — Prepare Stack
+# ============================================================
+# Purpose:    Stages compose file, sync worker sources, Neo4j schema
+#             and the blocklist source list; creates data directories
+#             with the UIDs each container runs as. No containers are
+#             started here.
+#
+# Container UIDs (bind mounts inherit host ownership):
+#   - engram-cortex : 999    (synuser, per Synapse Devops Guide)
+#   - engram-neo4j  : 7474   (neo4j user in the official image)
+#   - engram-sync   : 10001  (created in Dockerfile.sync)
+# ============================================================
+
+- name: 04.1 - Prepare Sentinel Engram stack
+  hosts: all_servers
+  become: yes
+
+  vars:
+    compose_file_name: "docker-compose-{{ project_name }}.yml"
+
+  tasks:
+    # ============================================================
+    # SECTION 1 — Directory tree
+    # ============================================================
+
+    - name: "[04.1.1.1] Create deployment directories"
+      ansible.builtin.file:
+        path: "{{ remote_deploy_base }}/{{ item }}"
+        state: directory
+        owner: "{{ deployment_user }}"
+        group: "{{ deployment_user }}"
+        mode: '0755'
+      loop:
+        - "config/nginx/conf.d"
+        - "config/nginx/certs"
+        - "config/neo4j"
+        - "sync"
+
+    - name: "[04.1.1.2] Create data directories with container UIDs"
+      ansible.builtin.file:
+        path: "{{ engram_data_base }}/{{ item.path }}"
+        state: directory
+        owner: "{{ item.uid }}"
+        group: "{{ item.uid }}"
+        mode: '0750'
+      loop:
+        - { path: "cortex",      uid: "999" }
+        - { path: "neo4j/data",  uid: "7474" }
+        - { path: "neo4j/logs",  uid: "7474" }
+        - { path: "sync_state",  uid: "10001" }
+
+    # ============================================================
+    # SECTION 2 — Stack manifests
+    # ============================================================
+
+    # template, not copy: the compose file carries pinned image
+    # digests, IPs and memory limits from group_vars.
+    - name: "[04.1.2.1] Render docker-compose file"
+      ansible.builtin.template:
+        src: "{{ engram_repo_source_dir }}/docker/docker-compose-sentinel-engram.yml.j2"
+        dest: "{{ remote_deploy_base }}/{{ compose_file_name }}"
+        owner: "{{ deployment_user }}"
+        group: "{{ deployment_user }}"
+        mode: '0644'
+
+    - name: "[04.1.2.2] Copy sync worker sources (build context)"
+      ansible.builtin.copy:
+        src: "{{ engram_repo_source_dir }}/config/sync/{{ item }}"
+        dest: "{{ remote_deploy_base }}/sync/{{ item }}"
+        owner: "{{ deployment_user }}"
+        mode: '0644'
+      loop:
+        - "engram_sync.py"
+        - "requirements.txt"
+
+    # Dockerfile is templated for the pinned base image digest.
+    - name: "[04.1.2.3] Render sync worker Dockerfile"
+      ansible.builtin.template:
+        src: "{{ engram_repo_source_dir }}/config/sync/Dockerfile.sync.j2"
+        dest: "{{ remote_deploy_base }}/sync/Dockerfile.sync"
+        owner: "{{ deployment_user }}"
+        mode: '0644'
+
+    - name: "[04.1.2.4] Copy Neo4j schema (constraints + indexes)"
+      ansible.builtin.copy:
+        src: "{{ engram_repo_source_dir }}/config/neo4j/schema.cypher"
+        dest: "{{ remote_deploy_base }}/config/neo4j/schema.cypher"
+        owner: "{{ deployment_user }}"
+        mode: '0644'
+
+    # ============================================================
+    # SECTION 3 — Blocklist source list
+    # ------------------------------------------------------------
+    # Read from the Cyber Sentinel repo (Pi-hole adlists.txt) — one
+    # source of truth. A list added to Pi-hole shows up in Synapse on
+    # the next deploy of this playbook.
+    # ============================================================
+
+    - name: "[04.1.3.1] Verify Cyber Sentinel adlists file exists on control host"
+      ansible.builtin.stat:
+        path: "{{ cs_adlists_file }}"
+      register: adlists_stat
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: "[04.1.3.2] Fail if adlists file is missing"
+      ansible.builtin.assert:
+        that: adlists_stat.stat.exists
+        fail_msg: "{{ cs_adlists_file }} not found — set cs_repo_source_dir in group_vars."
+        quiet: true
+      run_once: true
+
+    - name: "[04.1.3.3] Copy blocklist sources to sync state directory"
+      ansible.builtin.copy:
+        src: "{{ cs_adlists_file }}"
+        dest: "{{ remote_deploy_base }}/sync/blocklists.txt"
+        owner: "{{ deployment_user }}"
+        mode: '0644'

@@ -1,0 +1,54 @@
+# Sentinel Engram — cortex.{{ domain_suffix }} → Synapse Cortex HTTPS API
+# Rendered by playbook 05. Do not edit on host.
+
+server {
+    listen 80;
+    server_name {{ item.name }}.{{ domain_suffix }};
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name {{ item.name }}.{{ domain_suffix }};
+
+    ssl_certificate     /etc/nginx/certs/{{ item.name }}.crt;
+    ssl_certificate_key /etc/nginx/certs/{{ item.name }}.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    # Storm feed / bulk requests carry large JSON bodies.
+    client_max_body_size 64m;
+
+    resolver 127.0.0.11 valid=30s;
+
+    location / {
+        set $upstream_host {{ item.internal_host }};
+        # Cortex serves HTTPS with a self-signed cert generated on first
+        # boot. The hop is container-to-container on the internal
+        # network, so upstream verification is off.
+        proxy_pass https://$upstream_host:{{ item.port }};
+        proxy_ssl_verify off;
+        proxy_ssl_server_name on;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # /api/v1/storm streams results with chunked encoding (one JSON
+        # message per chunk). Buffering breaks message boundaries and
+        # stalls long queries — the Synapse HTTP API docs call out Nginx
+        # interfering with chunked streams specifically.
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        # /api/v1/mcp (MCP Streamable HTTP, beta) uses Server-Sent Events.
+        proxy_set_header Connection "";
+        proxy_cache off;
+    }
+}

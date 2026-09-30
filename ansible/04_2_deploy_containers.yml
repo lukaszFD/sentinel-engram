@@ -1,0 +1,40 @@
+---
+# ============================================================
+# Sentinel Engram — Playbook 04.2 — Deploy Docker Stack
+# ============================================================
+# Purpose:    Pulls pinned images, builds the sync worker image and
+#             starts the long-running services (cortex, neo4j). The
+#             sync worker is profile-gated and only BUILT here —
+#             systemd runs it (playbook 06).
+# ============================================================
+
+- name: 04.2 - Deploy Docker stack
+  hosts: all_servers
+  become: yes
+
+  vars:
+    compose_file_name: "docker-compose-{{ project_name }}.yml"
+    compose_cmd: "docker compose -f {{ compose_file_name }} -p {{ project_name }}"
+
+  tasks:
+    - name: "[04.2.1.1] Pull pinned images (by digest)"
+      ansible.builtin.command:
+        cmd: "{{ compose_cmd }} pull engram-cortex engram-neo4j"
+        chdir: "{{ remote_deploy_base }}"
+      changed_when: false
+
+    - name: "[04.2.1.2] Build sync worker image"
+      ansible.builtin.command:
+        cmd: "{{ compose_cmd }} --profile sync build engram-sync"
+        chdir: "{{ remote_deploy_base }}"
+      register: sync_build
+      changed_when: "'Built' in sync_build.stderr or 'Built' in sync_build.stdout"
+
+    # --wait blocks until both healthchecks pass (Cortex first boot
+    # generates its TLS cert and root user; Neo4j initializes /data).
+    - name: "[04.2.1.3] Start Cortex and Neo4j (wait for healthy)"
+      ansible.builtin.command:
+        cmd: "{{ compose_cmd }} up -d --wait --wait-timeout 600 engram-cortex engram-neo4j"
+        chdir: "{{ remote_deploy_base }}"
+      register: deploy_output
+      changed_when: "'Started' in deploy_output.stderr or 'Recreated' in deploy_output.stderr"
